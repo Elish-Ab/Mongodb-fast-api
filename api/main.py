@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse
 
 from pymongo import MongoClient, UpdateOne
 from pymongo.database import Database
-from pymongo.errors import BulkWriteError
+from pymongo.errors import BulkWriteError, PyMongoError
 import pymongo
 
 from bson import ObjectId, json_util
@@ -899,12 +899,11 @@ def enrich_missing_apns(limit: int = 10, skip_already_enriched: bool = True, db:
     MAX_RETRIES = 3
     RETRY_DELAY = 2
     CONFIDENCE_THRESHOLD = 80
-    APIFY_TOKEN = os.getenv("APIFY_API_TOKEN")
 
     # --- Metrics ---
     metrics = {
         "processed": 0,
-        "sources": {"local_db": 0, "google": 0, "apify": 0},
+        "sources": {"local_db": 0, "google": 0},
         "durations": [],
         "errors": [],
         "errors_breakdown": {"timeout": 0, "captcha": 0, "no_apn_found": 0}
@@ -989,20 +988,6 @@ def enrich_missing_apns(limit: int = 10, skip_already_enriched: bool = True, db:
             except Exception as e:
                 logger.warning(f"Google scraping failed for {candidate_id}: {e}")
 
-            # --- Step 3: Apify Backup ---
-            if APIFY_TOKEN:
-                try:
-                    apn = retry_wrapper(apify_general_scrape, full_address, APIFY_TOKEN, label="Apify")
-                    if apn:
-                        method = "apify"
-                        status = "enriched_via_apify"
-                        metrics["sources"]["apify"] += 1
-                        results.append(success_result(candidate_id, apn, None, method))
-                        move_out_of_fallback(apn, raw_data, db, candidate_id)
-                        continue
-                except Exception as e:
-                    logger.warning(f"Apify scrape failed for {candidate_id}: {e}")
-
             # --- All steps failed ---
             logger.warning(f"No APN found for {candidate_id}")
             metrics["errors_breakdown"]["no_apn_found"] += 1
@@ -1046,7 +1031,6 @@ def enrich_missing_apns(limit: int = 10, skip_already_enriched: bool = True, db:
                 logger.error(f"Failed to update candidate {candidate_id}: {str(e)}")
             time.sleep(random.uniform(1, 3))
 
-        # Optional: intermediate logging for large batches
         if metrics["processed"] % 5 == 0:
             logger.info(f"Progress: {metrics['processed']} processed, "
                         f"{sum(metrics['sources'].values())} successful so far.")
@@ -1074,7 +1058,6 @@ def enrich_missing_apns(limit: int = 10, skip_already_enriched: bool = True, db:
             "success_rate": round(success_rate, 1),
             "google_wins": metrics["sources"]["google"],
             "db_wins": metrics["sources"]["local_db"],
-            "apify_wins": metrics["sources"]["apify"],
             "errors": len(metrics["errors"]),
             "average_time_sec": round(avg_time, 2)
         }
@@ -1083,26 +1066,40 @@ def enrich_missing_apns(limit: int = 10, skip_already_enriched: bool = True, db:
 
 @app.post("/scrape/kingcounty/json", tags=["Scraping"])
 async def scrape_kingcounty_json(file: UploadFile = File(...)) -> List[dict]:
-    try:
-        # Save uploaded file to a temporary path
-        temp_input = os.path.join(tempfile.gettempdir(), file.filename)
-        with open(temp_input, "wb") as f:
-            f.write(await file.read())
+    temp_input_path = None
+    temp_output_path = None
 
-        # Output file path
-        temp_output = os.path.join(tempfile.gettempdir(), f"scraped_{file.filename}")
+    try:
+        # Create a temporary file for the input
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp_in:
+            tmp_in.write(await file.read())
+            temp_input_path = tmp_in.name
+
+        # Define output path
+        temp_output_path = os.path.join(
+            tempfile.gettempdir(), f"scraped_{os.path.basename(temp_input_path)}"
+        )
 
         # Run the scraper
-        scrape_king_county_properties(temp_input, temp_output)
+        scrape_king_county_properties(temp_input_path, temp_output_path)
 
-        # Load and return results as JSON
-        df = pd.read_csv(temp_output)
+        # Load and return results
+        df = pd.read_csv(temp_output_path)
         return df.to_dict(orient="records")
 
     except Exception as e:
         logging.error(f"King County scraping failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Scraper failed: " + str(e))
-    
+
+    finally:
+        # Clean up temp files
+        for path in [temp_input_path, temp_output_path]:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception as cleanup_err:
+                    logging.warning(f"Failed to delete temp file {path}: {cleanup_err}")
+
 
 @app.post("/scrape/kingcounty/mongo", tags=["Scraping"])
 def scrape_kingcounty_from_mongo(
@@ -1115,12 +1112,16 @@ def scrape_kingcounty_from_mongo(
     """
     try:
         mongo_uri = os.getenv("MONGO_URI")
+        if not mongo_uri:
+            logger.error("❌ MONGO_URI is not configured in the environment.")
+            raise HTTPException(status_code=500, detail="MONGO_URI is not configured")
+
         db_name = os.getenv("DB_NAME", "RealEstate")
         collection_name = "properties"
 
-        if not mongo_uri:
-            raise HTTPException(status_code=500, detail="MONGO_URI not configured")
+        logger.info(f"🔄 Starting King County scrape for up to {limit} records")
 
+        # Execute scraper
         scrape_from_mongo_and_update(
             mongo_uri=mongo_uri,
             db_name=db_name,
@@ -1128,20 +1129,170 @@ def scrape_kingcounty_from_mongo(
             limit=limit
         )
 
+        logger.info("✅ King County scraping completed successfully.")
         return {
             "status": "completed",
             "message": f"Scraping finished for up to {limit} properties."
         }
 
+    except HTTPException:
+        raise  # preserve HTTPException as-is
+
     except Exception as e:
-        logger.error(f"KingCounty Mongo scraping failed: {str(e)}", exc_info=True)
+        logger.error(f"💥 KingCounty Mongo scraping failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Mongo-based scrape failed: " + str(e))
+
+
+def export_full_data(db=Depends(get_db)):
+    try:
+        cursor = db.properties.find().batch_size(1000)
+
+        def generate_rows():
+            for prop in cursor:
+                apn = prop.get("apn")
+                owner = db.owners.find_one({"apn": apn}) or {}
+                phones = db.phones.find({"phone_id": {"$in": owner.get("phone_ids", [])}})
+                phone_numbers = [p["number"] for p in phones]
+                life_events = db.life_events.find({"apn": apn})
+                row = {
+                    "apn": apn,
+                    "property_address": prop.get("address", {}).get("street", ""),
+                    # ... other fields ...
+                    "phones": ", ".join(phone_numbers),
+                    "life_events": "; ".join(
+                        f"{le['event_type']} ({le.get('event_date', '')})" for le in life_events
+                    )
+                }
+                yield row
+
+        def stream_csv():
+            output = io.StringIO()
+            writer = None
+            for row in generate_rows():
+                if writer is None:
+                    writer = csv.DictWriter(output, fieldnames=row.keys())
+                    writer.writeheader()
+                writer.writerow(row)
+                yield output.getvalue()
+                output.seek(0)
+                output.truncate(0)
+
+        return StreamingResponse(stream_csv(), media_type="text/csv")
+
+    except PyMongoError as e:
+        logger.error(f"MongoDB error: {e}")
+        raise HTTPException(status_code=500, detail="MongoDB unavailable.")
 
 @app.post("/enrich/violations", tags=["Enrichment"])
 def enrich_violations(limit: int = 50):
     from api.scrapers.code_violation import enrich_seattle_violations  # type: ignore
     return enrich_seattle_violations(limit=limit)
 
+
+import signal
+
+class TimeoutException(Exception):
+    pass
+
+def handler(signum, frame):
+    raise TimeoutException("Operation timed out")
+
+def run_with_timeout(func, timeout_seconds=60, *args, **kwargs):
+    signal.signal(signal.SIGALRM, handler)
+    signal.alarm(timeout_seconds)
+    try:
+        return func(*args, **kwargs)
+    finally:
+        signal.alarm(0)
+@app.get("/properties", tags=["Query"])
+def list_properties(skip: int = 0, limit: int = 100, db=Depends(get_db)):
+    cursor = db.properties.find().skip(skip).limit(min(limit, 1000)).batch_size(100)
+    return [json_util.loads(json_util.dumps(doc)) for doc in cursor]
+
+
+# @app.get("/export/full", tags=["Export"])
+# def export_full_data(db=Depends(get_db)):
+#     try:
+#         properties = list(db.properties.find())
+#         owners = {o["apn"]: o for o in db.owners.find()}
+#         phones = {p["phone_id"]: p for p in db.phones.find()}
+#         life_events_map = {}
+#         for le in db.life_events.find():
+#             apn = le.get("apn")
+#             if apn not in life_events_map:
+#                 life_events_map[apn] = []
+#             life_events_map[apn].append(le)
+
+#         rows = []
+#         for prop in properties:
+#             apn = prop.get("apn")
+#             owner = owners.get(apn, {})
+#             owner_phones = [phones[pid] for pid in owner.get("phone_ids", []) if pid in phones]
+#             phone_numbers = [p["number"] for p in owner_phones]
+#             phone_tags = [",".join(p.get("tags", [])) for p in owner_phones]
+
+#             row = {
+#                 "apn": apn,
+#                 "property_address": prop.get("address", {}).get("street", ""),
+#                 "property_city": prop.get("address", {}).get("city", ""),
+#                 "property_state": prop.get("address", {}).get("state", ""),
+#                 "property_zip": prop.get("address", {}).get("zip", ""),
+#                 "estimated_value": prop.get("valuation", {}).get("estimated_value"),
+#                 "last_sale_price": prop.get("valuation", {}).get("last_sale_price"),
+#                 "owner_full_name": owner.get("full_name", ""),
+#                 "owner_email": ", ".join(owner.get("emails", [])),
+#                 "phones": ", ".join(phone_numbers),
+#                 "phone_tags": "; ".join(phone_tags),
+#                 "tags": ", ".join(owner.get("tags", [])),
+#                 "status": owner.get("status", ""),
+#                 "life_events": "; ".join([
+#                     f"{le['event_type']} ({le.get('event_date', '')})"
+#                     for le in life_events_map.get(apn, [])
+#                 ])
+#             }
+#             rows.append(row)
+
+#         df = pd.DataFrame(rows)
+#         output = io.StringIO()
+#         df.to_csv(output, index=False)
+#         output.seek(0)
+#         return StreamingResponse(
+#             output,
+#             media_type="text/csv",
+#             headers={"Content-Disposition": "attachment; filename=full_export.csv"}
+#         )
+#     except PyMongoError as e:
+#         logger.error(f"MongoDB error: {e}")
+#         raise HTTPException(status_code=500, detail="MongoDB is currently unavailable.")
+
+@app.get("/export/fallback", tags=["Export"])
+def export_fallback_candidates(db=Depends(get_db)):
+    try:
+        cursor = db.fallback_candidates.find().batch_size(10)
+
+        def generate_csv():
+            first = True
+            for doc in cursor:
+                row = doc.get("raw_data", {})
+                row["reason"] = doc.get("reason", "")
+                row["status"] = doc.get("status", "")
+                row["created_at"] = doc.get("created_at", "").isoformat() if doc.get("created_at") else ""
+                if first:
+                    yield ','.join(row.keys()) + '\n'
+                    first = False
+                yield ','.join(f'"{str(row.get(k, "")).replace("\"", "\"\"")}"' for k in row.keys()) + '\n'
+
+        return StreamingResponse(
+            generate_csv(),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=fallback_candidates.csv"}
+        )
+    except PyMongoError as e:
+        logger.error(f"MongoDB error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to export fallback candidates due to DB error.")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail="Unexpected failure during export.")
 @app.get("/", tags=["System"])
 def root():
     return {
