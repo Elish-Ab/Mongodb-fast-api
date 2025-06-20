@@ -38,8 +38,9 @@ import pandas as pd
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from api.scrapers.selenium_google import get_parcel_number # type: ignore
+from api.scrapers.kingCounty_Scraper import scrape_from_mongo_and_update # type: ignore
 from api.scrapers.kingCounty_Scraper import scrape_king_county_properties # type: ignore
-from api.scrapers.kingCounty_Scraper import scrape_from_mongo_and_update  # type: ignore
+
 
 # Logging
 logger = logging.getLogger(__name__)

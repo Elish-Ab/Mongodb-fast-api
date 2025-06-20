@@ -4,19 +4,17 @@ import re
 import random
 import logging
 import urllib.parse
+import shutil
 
-from selenium import webdriver # type: ignore
-from selenium.webdriver.common.by import By # type: ignore
-from selenium.webdriver.support.ui import WebDriverWait # type: ignore
-from selenium.webdriver.support import expected_conditions as EC # type: ignore
-from selenium.common.exceptions import TimeoutException # type: ignore
-from webdriver_manager.chrome import ChromeDriverManager # type: ignore
-from selenium.webdriver.chrome.service import Service   # type: ignore
+from selenium import webdriver  # type: ignore
+from selenium.webdriver.common.by import By  # type: ignore
+from selenium.webdriver.support.ui import WebDriverWait  # type: ignore
+from selenium.webdriver.support import expected_conditions as EC  # type: ignore
+from selenium.common.exceptions import TimeoutException  # type: ignore
+from selenium.webdriver.chrome.service import Service  # type: ignore
 
 logger = logging.getLogger(__name__)
 
-# Ensure WDM uses local cache to avoid repeat downloads
-os.environ["WDM_LOCAL"] = "1"
 
 def get_driver():
     options = webdriver.ChromeOptions()
@@ -24,11 +22,12 @@ def get_driver():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_argument("--disable-infobars")
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--disable-notifications")
     options.add_argument("--remote-debugging-port=9222")
+
+    options.binary_location = "/opt/google/chrome-beta/chrome"
 
     user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
@@ -37,10 +36,15 @@ def get_driver():
     ]
     options.add_argument(f"user-agent={random.choice(user_agents)}")
 
-    service = Service(ChromeDriverManager().install())
+    driver_path = shutil.which("chromedriver")
+    if not driver_path:
+        raise RuntimeError("❌ chromedriver not found in PATH. Install it manually.")
+
+    service = Service(driver_path)
     driver = webdriver.Chrome(service=service, options=options)
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     return driver
+
 
 def handle_cookies(driver):
     try:
@@ -52,13 +56,15 @@ def handle_cookies(driver):
     except TimeoutException:
         pass
 
-def get_parcel_number(search_term: str, candidate_id: str) -> str:
+
+def get_parcel_number(search_term: str, candidate_id: str) -> str | None:
     driver = get_driver()
     try:
         query = urllib.parse.quote_plus(search_term)
         driver.get(f"https://www.google.com/search?q={query}")
         handle_cookies(driver)
 
+        # 🔎 Try .gov links
         try:
             links = WebDriverWait(driver, 30).until(
                 EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a[href*='.gov']"))
@@ -90,9 +96,9 @@ def get_parcel_number(search_term: str, candidate_id: str) -> str:
                     logger.warning(f"Failed to scrape {url}: {e}")
                     driver.back()
         except TimeoutException:
-            logger.warning(f"No gov links found for {candidate_id}, checking snippets")
+            logger.warning(f"No .gov links found for {candidate_id}, checking snippets")
 
-        # Fallback to search result snippets
+        # 🔄 Fallback to snippets
         snippets = driver.find_elements(By.XPATH, "//div[contains(@class, 'VwiC3b')]")
         patterns = [
             r"Parcel Number[:\s]*(\d{10})",
@@ -122,8 +128,10 @@ def get_parcel_number(search_term: str, candidate_id: str) -> str:
         with open(f"debug_google_{candidate_id}_error.html", "w") as f:
             f.write(driver.page_source)
         return None
+
     finally:
         driver.quit()
+
 
 if __name__ == "__main__":
     test_search = "123 Main St, Seattle, WA parcel number -site:zillow.com"
