@@ -1206,64 +1206,9 @@ def run_with_timeout(func, timeout_seconds=60, *args, **kwargs):
         signal.alarm(0)
 @app.get("/properties", tags=["Query"])
 def list_properties(skip: int = 0, limit: int = 100, db=Depends(get_db)):
-    cursor = db.properties.find().skip(skip).limit(min(limit, 1000)).batch_size(100)
+    cursor = db.properties.find().skip(skip).limit(min(limit, 1000)).batch_size(1000)
     return [json_util.loads(json_util.dumps(doc)) for doc in cursor]
 
-
-# @app.get("/export/full", tags=["Export"])
-# def export_full_data(db=Depends(get_db)):
-#     try:
-#         properties = list(db.properties.find())
-#         owners = {o["apn"]: o for o in db.owners.find()}
-#         phones = {p["phone_id"]: p for p in db.phones.find()}
-#         life_events_map = {}
-#         for le in db.life_events.find():
-#             apn = le.get("apn")
-#             if apn not in life_events_map:
-#                 life_events_map[apn] = []
-#             life_events_map[apn].append(le)
-
-#         rows = []
-#         for prop in properties:
-#             apn = prop.get("apn")
-#             owner = owners.get(apn, {})
-#             owner_phones = [phones[pid] for pid in owner.get("phone_ids", []) if pid in phones]
-#             phone_numbers = [p["number"] for p in owner_phones]
-#             phone_tags = [",".join(p.get("tags", [])) for p in owner_phones]
-
-#             row = {
-#                 "apn": apn,
-#                 "property_address": prop.get("address", {}).get("street", ""),
-#                 "property_city": prop.get("address", {}).get("city", ""),
-#                 "property_state": prop.get("address", {}).get("state", ""),
-#                 "property_zip": prop.get("address", {}).get("zip", ""),
-#                 "estimated_value": prop.get("valuation", {}).get("estimated_value"),
-#                 "last_sale_price": prop.get("valuation", {}).get("last_sale_price"),
-#                 "owner_full_name": owner.get("full_name", ""),
-#                 "owner_email": ", ".join(owner.get("emails", [])),
-#                 "phones": ", ".join(phone_numbers),
-#                 "phone_tags": "; ".join(phone_tags),
-#                 "tags": ", ".join(owner.get("tags", [])),
-#                 "status": owner.get("status", ""),
-#                 "life_events": "; ".join([
-#                     f"{le['event_type']} ({le.get('event_date', '')})"
-#                     for le in life_events_map.get(apn, [])
-#                 ])
-#             }
-#             rows.append(row)
-
-#         df = pd.DataFrame(rows)
-#         output = io.StringIO()
-#         df.to_csv(output, index=False)
-#         output.seek(0)
-#         return StreamingResponse(
-#             output,
-#             media_type="text/csv",
-#             headers={"Content-Disposition": "attachment; filename=full_export.csv"}
-#         )
-#     except PyMongoError as e:
-#         logger.error(f"MongoDB error: {e}")
-#         raise HTTPException(status_code=500, detail="MongoDB is currently unavailable.")
 
 @app.get("/export/fallback", tags=["Export"])
 def export_fallback_candidates(db=Depends(get_db)):
@@ -1293,6 +1238,63 @@ def export_fallback_candidates(db=Depends(get_db)):
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         raise HTTPException(status_code=500, detail="Unexpected failure during export.")
+
+@app.get("/export/full", tags=["Export"])
+def export_full_data(db=Depends(get_db)):
+    try:
+        cursor = db.properties.find().batch_size(1000)
+
+        def generate_rows():
+            for prop in cursor:
+                apn = prop.get("apn")
+                owner = db.owners.find_one({"apn": apn}) or {}
+                phones_cursor = db.phones.find({"phone_id": {"$in": owner.get("phone_ids", [])}})
+                phone_numbers = [p.get("number", "") for p in phones_cursor]
+                phone_tags = [";".join(p.get("tags", [])) for p in phones_cursor]
+                life_events = db.life_events.find({"apn": apn})
+                life_event_str = "; ".join(
+                    f"{le.get('event_type', '')} ({le.get('event_date', '')})"
+                    for le in life_events
+                )
+
+                yield {
+                    "apn": apn,
+                    "property_address": prop.get("address", {}).get("street", ""),
+                    "property_city": prop.get("address", {}).get("city", ""),
+                    "property_state": prop.get("address", {}).get("state", ""),
+                    "property_zip": prop.get("address", {}).get("zip", ""),
+                    "estimated_value": prop.get("valuation", {}).get("estimated_value"),
+                    "last_sale_price": prop.get("valuation", {}).get("last_sale_price"),
+                    "owner_full_name": owner.get("full_name", ""),
+                    "owner_email": ", ".join(owner.get("emails", [])),
+                    "phones": ", ".join(phone_numbers),
+                    "phone_tags": "; ".join(phone_tags),
+                    "tags": ", ".join(owner.get("tags", [])),
+                    "status": owner.get("status", ""),
+                    "life_events": life_event_str
+                }
+
+        def stream_csv():
+            output = io.StringIO()
+            writer = None
+            for row in generate_rows():
+                if writer is None:
+                    writer = csv.DictWriter(output, fieldnames=row.keys())
+                    writer.writeheader()
+                writer.writerow(row)
+                yield output.getvalue()
+                output.seek(0)
+                output.truncate(0)
+
+        return StreamingResponse(
+            stream_csv(),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=full_export.csv"}
+        )
+
+    except PyMongoError as e:
+        logger.error(f"MongoDB error during export: {e}")
+        raise HTTPException(status_code=500, detail="MongoDB unavailable during export.")
 @app.get("/", tags=["System"])
 def root():
     return {

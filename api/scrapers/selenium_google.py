@@ -6,15 +6,15 @@ import logging
 import urllib.parse
 import shutil
 
-from selenium import webdriver  # type: ignore
-from selenium.webdriver.common.by import By  # type: ignore
-from selenium.webdriver.support.ui import WebDriverWait  # type: ignore
-from selenium.webdriver.support import expected_conditions as EC  # type: ignore
-from selenium.common.exceptions import TimeoutException  # type: ignore
-from selenium.webdriver.chrome.service import Service  # type: ignore
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
+from selenium.webdriver.chrome.service import Service
 
 logger = logging.getLogger(__name__)
-
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 def get_driver():
     options = webdriver.ChromeOptions()
@@ -26,7 +26,6 @@ def get_driver():
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--disable-notifications")
     options.add_argument("--remote-debugging-port=9222")
-
     options.binary_location = "/opt/google/chrome-beta/chrome"
 
     user_agents = [
@@ -42,9 +41,10 @@ def get_driver():
 
     service = Service(driver_path)
     driver = webdriver.Chrome(service=service, options=options)
+    driver.set_page_load_timeout(60)
+    driver.set_script_timeout(60)
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     return driver
-
 
 def handle_cookies(driver):
     try:
@@ -56,84 +56,111 @@ def handle_cookies(driver):
     except TimeoutException:
         pass
 
+def extract_apn_from_text(text):
+    patterns = [
+        r"Parcel Number[:\s]*(\d{10})",
+        r"Parcel ID[:\s]*(\d{10})",
+        r"Tax Parcel[:\s]*(\d{10})",
+        r"Parcel Number[:\s]*(\d{3}-\d{3}-\d{3})",
+        r"Parcel ID[:\s]*(\d{3}-\d{3}-\d{3})"
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1).replace("-", "")
+    return None
 
-def get_parcel_number(search_term: str, candidate_id: str) -> str | None:
-    driver = get_driver()
-    try:
-        query = urllib.parse.quote_plus(search_term)
-        driver.get(f"https://www.google.com/search?q={query}")
-        handle_cookies(driver)
-
-        # 🔎 Try .gov links
+def get_parcel_number(search_term: str, candidate_id: str, driver=None, retries=3) -> str | None:
+    attempt = 0
+    while attempt < retries:
         try:
-            links = WebDriverWait(driver, 30).until(
-                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a[href*='.gov']"))
-            )
-            for link in links[:3]:
-                url = link.get_attribute("href")
-                if "zillow.com" in url:
-                    continue
-                try:
-                    driver.get(url)
-                    WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-                    page_source = driver.page_source
-                    patterns = [
-                        r"Parcel Number[:\s]*(\d{10})",
-                        r"Parcel ID[:\s]*(\d{10})",
-                        r"Tax Parcel[:\s]*(\d{10})",
-                        r"Parcel Number[:\s]*(\d{3}-\d{3}-\d{3})",
-                        r"Parcel ID[:\s]*(\d{3}-\d{3}-\d{3})"
-                    ]
-                    for pattern in patterns:
-                        match = re.search(pattern, page_source, re.IGNORECASE)
-                        if match:
-                            apn = match.group(1).replace("-", "")
-                            logger.info(f"[Google] Found APN via {pattern} on {url}: {apn}")
-                            return apn
-                    driver.back()
-                    time.sleep(random.uniform(1, 3))
-                except Exception as e:
-                    logger.warning(f"Failed to scrape {url}: {e}")
-                    driver.back()
-        except TimeoutException:
-            logger.warning(f"No .gov links found for {candidate_id}, checking snippets")
+            if driver is None:
+                driver = get_driver()
+                own_driver = True
+            else:
+                own_driver = False
 
-        # 🔄 Fallback to snippets
-        snippets = driver.find_elements(By.XPATH, "//div[contains(@class, 'VwiC3b')]")
-        patterns = [
-            r"Parcel Number[:\s]*(\d{10})",
-            r"Parcel ID[:\s]*(\d{10})",
-            r"Tax Parcel[:\s]*(\d{10})",
-            r"Parcel Number[:\s]*(\d{3}-\d{3}-\d{3})",
-            r"Parcel ID[:\s]*(\d{3}-\d{3}-\d{3})"
-        ]
-        for snippet in snippets:
-            text = snippet.text.replace(",", "")
-            for pattern in patterns:
-                match = re.search(pattern, text, re.IGNORECASE)
-                if match:
-                    apn = match.group(1).replace("-", "")
+            query = urllib.parse.quote_plus(search_term)
+            driver.get(f"https://www.google.com/search?q={query}")
+            handle_cookies(driver)
+            time.sleep(random.uniform(1, 2))
+
+            # Step 1: Try .gov links
+            try:
+                links = driver.find_elements(By.CSS_SELECTOR, "a[href*='.gov']")
+                for i in range(min(len(links), 3)):
+                    link = driver.find_elements(By.CSS_SELECTOR, "a[href*='.gov']")[i]
+                    url = link.get_attribute("href")
+                    if "zillow.com" in url:
+                        continue
+                    try:
+                        driver.get(url)
+                        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+                        page_source = driver.page_source
+                        apn = extract_apn_from_text(page_source)
+                        if apn:
+                            logger.info(f"[Google] Found APN via .gov page on {url}: {apn}")
+                            return apn
+                        driver.back()
+                        time.sleep(random.uniform(1, 2))
+                    except Exception as e:
+                        logger.warning(f"Failed to scrape {url}: {e}")
+                        driver.back()
+            except Exception as e:
+                logger.warning(f"No .gov links found for {candidate_id}: {e}")
+
+            # Step 2: Fallback to Google snippets
+            snippets = driver.find_elements(By.XPATH, "//div[contains(@class, 'VwiC3b')]")
+            for snippet in snippets:
+                text = snippet.text.replace(",", "")
+                apn = extract_apn_from_text(text)
+                if apn:
                     logger.info(f"[Google Snippet] Found APN: {apn}")
                     return apn
 
-        logger.warning(f"No APN found for candidate {candidate_id}")
-        with open(f"debug_google_{candidate_id}.html", "w") as f:
-            f.write(driver.page_source)
-        return None
+            # Step 3: No APN found
+            logger.warning(f"No APN found for candidate {candidate_id}")
+            with open(f"debug_google_{candidate_id}.html", "w", encoding="utf-8") as f:
+                f.write(driver.page_source)
+            return None
 
-    except Exception as e:
-        logger.error(f"Parcel lookup failed for {candidate_id}: {e}")
-        if "recaptcha" in driver.page_source.lower() or "captcha" in str(e).lower():
-            logger.error(f"CAPTCHA detected during lookup for {candidate_id}")
-        with open(f"debug_google_{candidate_id}_error.html", "w") as f:
-            f.write(driver.page_source)
-        return None
+        except StaleElementReferenceException as e:
+            logger.error(f"Stale element error for {candidate_id}: {e}")
+        except TimeoutException as e:
+            logger.error(f"Timeout during scraping {candidate_id}: {e}")
+        except Exception as e:
+            logger.error(f"Parcel lookup failed for {candidate_id}: {e}")
+            if "captcha" in str(e).lower() or "recaptcha" in driver.page_source.lower():
+                logger.error(f"CAPTCHA detected during lookup for {candidate_id}")
+            with open(f"debug_google_{candidate_id}_error.html", "w", encoding="utf-8") as f:
+                f.write(driver.page_source)
+        finally:
+            attempt += 1
+            time.sleep(random.uniform(2, 4))
 
+            if own_driver:
+                driver.quit()
+
+    return None
+
+def scrape_batch(candidates: list[dict]):
+    driver = get_driver()
+    try:
+        for i, candidate in enumerate(candidates):
+            cid = candidate.get("id") or f"cand_{i}"
+            address = candidate.get("address")
+            if not address:
+                continue
+            apn = get_parcel_number(address, cid, driver=driver)
+            print(f"{cid} | {address} → APN: {apn}")
+            time.sleep(random.uniform(2, 4))  # Throttle between queries
     finally:
         driver.quit()
 
-
+# Example usage
 if __name__ == "__main__":
-    test_search = "123 Main St, Seattle, WA parcel number -site:zillow.com"
-    apn = get_parcel_number(test_search, "test")
-    print(f"APN for {test_search}: {apn}")
+    test_candidates = [
+        {"id": "test1", "address": "123 Main St, Seattle, WA parcel number -site:zillow.com"},
+        {"id": "test2", "address": "456 Pine St, Seattle, WA parcel number -site:zillow.com"}
+    ]
+    scrape_batch(test_candidates)
