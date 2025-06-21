@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 # ---------- Load Config ----------
 load_dotenv()
-API_URL = os.getenv("API_URL", "http://localhost:8000")
+API_URL = os.getenv("API_URL", "https://store-data.up.railway.app")
 API_KEY = os.getenv("API_KEY", "supersecureapikey123")
 HEADERS = {"X-API-KEY": API_KEY}
 
