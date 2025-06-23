@@ -1305,7 +1305,9 @@ def root():
             "enrich_missing_apn": "/fallback/enrich_missing_apn",
             "scrape_kingcounty_json": "/scrape/kingcounty/json",
             "scrape_kingcounty_mongo": "/scrape/kingcounty/mongo",
-            "enrich_violations": "/enrich/violations"
+            "enrich_violations": "/enrich/violations",
+            "export_fallbacks":"/export/fallback",
+            "export_all":"/export/full"
         },
         "docs": "/docs"
     }
