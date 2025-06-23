@@ -38,9 +38,11 @@ import pandas as pd
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from api.scrapers.selenium_google import get_parcel_number # type: ignore
-from api.scrapers.kingCounty_Scraper import scrape_from_mongo_and_update # type: ignore
-from api.scrapers.kingCounty_Scraper import scrape_king_county_properties # type: ignore
-
+# from api.scrapers.kingCounty_Scraper import scrape_from_mongo_and_update # type: ignore
+# from api.scrapers.kingCounty_Scraper import scrape_king_county_properties # type: ignore
+from fastapi import APIRouter, HTTPException
+from typing import Optional
+from api.scrapers.playwright_scraper import scrape_from_mongo_and_update_playwright # type:ignore
 
 # Logging
 logger = logging.getLogger(__name__)
@@ -52,7 +54,7 @@ logging.basicConfig(
 
 load_dotenv()
 app = FastAPI(title="Unified Real Estate Data API", version="1.0.0")
-
+router = APIRouter()
 API_KEY_NAME = "X-API-KEY"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=True)
 
@@ -977,7 +979,8 @@ def enrich_missing_apns(limit: int = 10, skip_already_enriched: bool = True, db:
             # --- Step 2: Google Scrape ---
             search_term = f"{full_address} parcel number -site:zillow.com"
             try:
-                apn = retry_wrapper(get_parcel_number, search_term, str(candidate_id), label="Google")
+                # ✅ FIXED: Removed extra argument
+                apn = retry_wrapper(get_parcel_number, search_term, label="Google")
                 if apn:
                     method = "google"
                     status = "enriched_via_google"
@@ -1063,43 +1066,35 @@ def enrich_missing_apns(limit: int = 10, skip_already_enriched: bool = True, db:
         }
     }
 
+# @app.post("/scrape/kingcounty/mongo", tags=["Scraping"])
+# async def scrape_kingcounty_from_mongo(limit: int = 10):
+#     try:
+#         logging.info(f"🔄 Starting King County scrape for up to {limit} records")
+#         scrape_from_mongo_and_update(
+#             mongo_uri=os.getenv("MONGO_URI"),
+#             db_name=os.getenv("MONGO_DB"),
+#             collection_name=os.getenv("MONGO_COLLECTION"),
+#             limit=limit
+#         )
+#         return {"message": f"Successfully scraped {limit} records from MongoDB"}
+#     except Exception as e:
+#         logging.error(f"💥 KingCounty Mongo scraping failed: {str(e)}", exc_info=True)
+#         raise HTTPException(status_code=500, detail="Scraper failed: " + str(e))
 
-@app.post("/scrape/kingcounty/json", tags=["Scraping"])
-async def scrape_kingcounty_json(file: UploadFile = File(...)) -> List[dict]:
-    temp_input_path = None
-    temp_output_path = None
-
+@router.post("/scrape/kingcounty/mongo/playwright", tags=["Scraping"])
+async def scrape_kingcounty_from_mongo_playwright(limit: Optional[int] = 10):
     try:
-        # Create a temporary file for the input
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp_in:
-            tmp_in.write(await file.read())
-            temp_input_path = tmp_in.name
-
-        # Define output path
-        temp_output_path = os.path.join(
-            tempfile.gettempdir(), f"scraped_{os.path.basename(temp_input_path)}"
+        logging.info(f"🔄 [Playwright] Starting King County scrape for up to {limit} records")
+        scrape_from_mongo_and_update_playwright(
+            mongo_uri=os.getenv("MONGO_URI"),
+            db_name=os.getenv("MONGO_DB"),
+            collection_name=os.getenv("MONGO_COLLECTION"),
+            limit=limit
         )
-
-        # Run the scraper
-        scrape_king_county_properties(temp_input_path, temp_output_path)
-
-        # Load and return results
-        df = pd.read_csv(temp_output_path)
-        return df.to_dict(orient="records")
-
+        return {"message": "✅ Playwright scrape completed successfully."}
     except Exception as e:
-        logging.error(f"King County scraping failed: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Scraper failed: " + str(e))
-
-    finally:
-        # Clean up temp files
-        for path in [temp_input_path, temp_output_path]:
-            if path and os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception as cleanup_err:
-                    logging.warning(f"Failed to delete temp file {path}: {cleanup_err}")
-
+        logging.error(f"💥 Playwright Mongo scraping failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/scrape/kingcounty/mongo", tags=["Scraping"])
 def scrape_kingcounty_from_mongo(
@@ -1122,7 +1117,7 @@ def scrape_kingcounty_from_mongo(
         logger.info(f"🔄 Starting King County scrape for up to {limit} records")
 
         # Execute scraper
-        scrape_from_mongo_and_update(
+        scrape_from_mongo_and_update_playwright(
             mongo_uri=mongo_uri,
             db_name=db_name,
             collection_name=collection_name,

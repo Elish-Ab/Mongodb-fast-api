@@ -8,6 +8,7 @@ dnspython==2.7.0
 email-validator==2.1.1
 Faker==37.1.0
 fastapi==0.115.12
+google-search-results
 h11==0.16.0
 idna==3.10
 numpy==2.2.5
